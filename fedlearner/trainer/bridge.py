@@ -68,7 +68,6 @@ class Bridge(object):
         self._next_iter_id = 0
         self._received_data = collections.defaultdict(dict)
         self._stream_queue = collections.deque()
-        self._stream_terminated = threading.Event()
 
         # bridge
         self._bridge = bridge_core.Bridge(
@@ -84,7 +83,7 @@ class Bridge(object):
 
     def _bridge_callback(self, bridge, event):
         if event == bridge_core.Bridge.Event.PEER_CLOSED:
-            logging.error("peer terminated")
+            logging.info("peer terminated")
             with self._condition:
                 self._peer_terminated = True
                 self._condition.notify_all()
@@ -108,17 +107,19 @@ class Bridge(object):
 
     def connect(self):
         self._bridge.start(wait=True)
+        self._stream_thread = threading.Thread(target=self._stream_fn)
+        self._stream_thread.start()
+
+    def _stream_fn(self):
         stream_response = self._client.StreamTransmit(self._stream_generator())
-        def fn():
-            for _ in stream_response:
-                pass
-        threading.Thread(target=fn).start()
+        for _ in stream_response:
+            pass
 
     def terminate(self):
         with self._condition:
             self._terminated = True
             self._condition.notify_all()
-        self._stream_terminated.wait()
+        self._stream_thread.join()
         self._bridge.stop(wait=True)
 
     def _stream_generator(self):
@@ -126,7 +127,6 @@ class Bridge(object):
             with self._condition:
                 while len(self._stream_queue) == 0:
                     if self._terminated:
-                        self._stream_terminated.set()
                         return
                     self._condition.wait()
                 msg = self._stream_queue.popleft()
@@ -138,7 +138,7 @@ class Bridge(object):
             if self._terminated:
                 raise RuntimeError("Bridge was terminated")
 
-            logging.info("transmit send: iter_id: %d, name: %s",
+            logging.debug("transmit send: iter_id: %d, name: %s",
                 msg.iter_id, msg.name)
             self._stream_queue.append(msg)
             self._condition.notifyAll()
@@ -146,7 +146,7 @@ class Bridge(object):
     def _transmit_handler(self, request):
         metrics.emit_counter('receive_counter', 1)
         with self._condition:
-            logging.info("transmit receive, iter_id: %d, name: %s",
+            logging.debug("transmit receive, iter_id: %d, name: %s",
                 request.iter_id, request.name)
             self._received_data[request.iter_id][request.name] = request
             self._condition.notifyAll()

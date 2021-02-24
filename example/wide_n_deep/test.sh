@@ -11,7 +11,9 @@ if [ "$ROLE" == "leader" ]; then
                      --data-path=data/leader/ \
                      --checkpoint-path=model/leader \
                      --save-checkpoint-steps=100 \
-                     --export-path=model/leader/saved_model 
+                     --export-path=model/leader/saved_model \
+                     --verbosity=2
+
 elif [ "$ROLE" == "follower" ]; then
     python follower.py --local-addr=localhost:50011 \
                        --peer-addr=localhost:50010 \
@@ -19,7 +21,8 @@ elif [ "$ROLE" == "follower" ]; then
                        --data-path=data/follower/ \
                        --checkpoint-path=model/follower \
                        --save-checkpoint-steps=100 \
-                       --export-path=model/follower/saved_model
+                       --export-path=model/follower/saved_model \
+                       --verbosity=2
 else
     echo "usage: $0 [leader | follower]"    
 fi

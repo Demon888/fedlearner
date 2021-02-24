@@ -106,27 +106,23 @@ class RetryInterceptor(grpc.UnaryUnaryClientInterceptor,
         srq = _SendRequestQueue(
             method_details.request_serializer, request_iterator)
 
-        bridge_response_iterator = _grpc_with_retry(
-            lambda: continuation(client_call_details, iter(srq)),
+        def debug_fn():
+            logging.warning("[Bridge] intercept_stream_stream will call"
+                "continuation(client_call_details, iter(srq))")
+            res = continuation(client_call_details, iter(srq))
+            logging.warning("[Bridge] intercept_stream_stream call"
+                "continuation(client_call_details, iter(srq)) return")
+            return res
+
+        bridge_response_iterator = _grpc_stream_with_retry(
+            #lambda: continuation(client_call_details, iter(srq)),
+            debug_fn,
             self._retry_interval)
 
         def response_iterator():
-            nonlocal bridge_response_iterator
-            while True:
-                try:
-                    for res in bridge_response_iterator:
-                        srq.ack(res.ack)
-                        yield method_details.response_deserializer(res.payload)
-                    return
-                except grpc.RpcError as e:
-                    if e.code() == grpc.StatusCode.UNAVAILABLE:
-                        srq.reset()
-                        bridge_response_iterator = _grpc_with_retry(
-                            lambda: continuation(
-                                client_call_details, iter(srq)),
-                            self._retry_interval)
-                        continue
-                    raise e
+            for res in bridge_response_iterator:
+                srq.ack(res.ack)
+                yield method_details.response_deserializer(res.payload)
 
         return response_iterator()
 
@@ -141,6 +137,8 @@ class _SendRequestQueue():
 
     def ack(self, ack):
         with self._lock:
+            logging.debug("[Bridge] stream receive ack: %d, self._seq: %d",
+                ack, self._seq)
             if ack >= self._seq:
                 return
             n = self._seq - ack
@@ -150,25 +148,35 @@ class _SendRequestQueue():
 
     def reset(self):
         with self._lock:
+            logging.debug("[Bridge] stream reset, self._next: %d"
+                ", self._seq: %d, len(self._deque): %d",
+                self._next, self._seq, len(self._deque))
             self._next = 0
 
     def __iter__(self):
+        self.reset()
         return self
 
     def __next__(self):
-        with self._lock:
-            if self._next == len(self._deque):
-                req = bridge_pb2.SendRequest(
-                    seq=self._seq,
-                    payload=self._request_serializer(
-                        next(self._request_iterator))
-                )
-                self._seq += 1
-                self._deque.append(req)
-            req = self._deque[self._next]
-            self._next += 1
+        try:
+            with self._lock:
+                if self._next == len(self._deque):
+                    req = bridge_pb2.SendRequest(
+                        seq=self._seq,
+                        payload=self._request_serializer(
+                            next(self._request_iterator))
+                    )
+                    self._seq += 1
+                    self._deque.append(req)
+                req = self._deque[self._next]
+                self._next += 1
+                logging.debug("[Bridge] stream send seq: %d"
+                    ", self._next: %d, self._seq: %d",
+                    req.seq, self._next, self._seq)
 
-            return req
+                return req
+        except Exception as e:
+            raise e
 
 def _grpc_with_retry(handle, interval=1):
     while True:
@@ -178,10 +186,33 @@ def _grpc_with_retry(handle, interval=1):
                 raise res
             return res
         except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNAVAILABLE:
+            if e.code() in (grpc.StatusCode.UNAVAILABLE,
+                            grpc.StatusCode.INTERNAL):
                 logging.warning("[Bridge] grpc error, status: %s"
                     ", details: %s, wait %ds for retry",
                     e.code(), e.details(), interval)
                 time.sleep(interval)
                 continue
             raise e
+
+def _grpc_stream_with_retry(handle, interval=1):
+
+    def response_iterator(init_stream_response):
+        stream_response = init_stream_response
+        while True:
+            try:
+                yield next(stream_response)
+            except grpc.RpcError as e:
+                if e.code() in (grpc.StatusCode.UNAVAILABLE,
+                                grpc.StatusCode.INTERNAL):
+                    logging.warning("[Bridge] grpc stream error, status: %s"
+                        ", details: %s, wait %ds for retry",
+                        e.code(), e.details(), interval)
+                    time.sleep(interval)
+                    logging.warning("[Bridge] will retry grpc stream")
+                    stream_response = _grpc_with_retry(handle, interval)
+                    logging.warning("[Bridge] _grpc_with_retry return")
+                    continue
+                raise e
+
+    return response_iterator(_grpc_with_retry(handle, interval))

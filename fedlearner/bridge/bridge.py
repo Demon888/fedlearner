@@ -272,7 +272,8 @@ class Bridge():
         return self._server.add_generic_rpc_handlers(generic_rpc_handlers)
 
     def _channel_callback(self, state):
-        #logging.debug("[Bridge] grpc channel callback state: %s", state.name)
+        logging.debug("[Bridge] grpc channel connectivity"
+                      " state: %s", state.name)
         if state in (grpc.ChannelConnectivity.IDLE,
                      grpc.ChannelConnectivity.CONNECTING,
                      grpc.ChannelConnectivity.READY):
@@ -299,9 +300,9 @@ class Bridge():
         with self._lock:
             next_state = self._next_state(self._state, event)
             if self._state != next_state:
-                logging.info("[Bridge] receive effective event: %s,"
-                    " current state: %s, next state: %s",
-                    event.name, self._state.name, next_state.name)
+                logging.info("[Bridge] state changed from %s to %s"
+                    ", event: %s",
+                    self._state.name, next_state.name, event.name)
                 self._state = next_state
                 self._condition.notify_all()
             self._event_set.add(event)
@@ -364,99 +365,64 @@ class Bridge():
         if wait:
             self.wait_for_termination()
 
-    def _call_locked(self, req):
+    def _call_locked(self, call_type):
         self._lock.release()
+        req = bridge_pb2.CallRequest(
+            type=call_type,
+            token=self._token,
+            identifier=self._identifier,
+            peer_identifier=self._peer_identifier,
+        )
         try:
             res = self._bridge_call.Call(req)
-        except grpc.RpcError as e:
-            logging.info("[Bridge] grpc channel return code: %s"
-                ", details: %s", e.code(), e.details())
-            res = None
         except Exception as e: #pylint: disable=broad-except
-            logging.error("[Bridge] grpc channel return error: %s", repr(e))
-            res = None
+            if isinstance(e, grpc.RpcError):
+                logging.warning("[Bridge] call type: %s"
+                    ", channel return code: %s"
+                    ", details: %s",
+                    bridge_pb2.CallType.Name(call_type),
+                    e.code(), e.details())
+            else:
+                logging.error("[Bridge] grpc channel return error: %s", repr(e))
+
+            self._lock.acquire()
+            return False
         self._lock.acquire()
-        return res
 
-    def _call_connect_locked(self):
-        res = self._call_locked(bridge_pb2.CallRequest(
-            type=bridge_pb2.CallType.CONNECT,
-            token=self._token,
-            identifier=self._identifier,
-            peer_identifier=self._peer_identifier))
-        if res is None:
+        def logging_error_and_return():
+            logging.error("[Bridge] return unexcepted code: %s"
+                ", for call type: %s",
+                bridge_pb2.Code.Name(res.code),
+                bridge_pb2.CallType.Name(call_type))
             return False
 
         if res.code == bridge_pb2.Code.OK:
-            self._emit_event(Bridge.Event.CONNECTED)
+            if call_type == bridge_pb2.CallType.CONNECT:
+                self._emit_event(Bridge.Event.CONNECTED)
+            elif call_type == bridge_pb2.CallType.CLOSE:
+                self._emit_event(Bridge.Event.CLOSED)
+            else:
+                pass
         elif res.code == bridge_pb2.Code.UNAUTHORIZED:
             logging.warning("[Bridge] authentication failed")
             self._emit_event(Bridge.Event.UNAUTHORIZED)
             return False
         elif res.code == bridge_pb2.Code.UNIDENTIFIED:
-            logging.warning("[Bridge] unidentified bridge")
-            self._emit_event(Bridge.Event.UNIDENTIFIED)
-            return False
-        else:
-            logging.error("[Bridge] call connect got unexcepted code: %s",
-                bridge_pb2.Code.Name(res.code))
-            return False
-        return True
-
-    def _call_heartbeat_locked(self):
-        res = self._call_locked(bridge_pb2.CallRequest(
-            type=bridge_pb2.CallType.HEARTBEAT,
-            token=self._token,
-            identifier=self._identifier,
-            peer_identifier=self._peer_identifier))
-        if res is None:
-            return False
-
-        if res.code == bridge_pb2.Code.OK:
-            pass
-        elif res.code == bridge_pb2.Code.UNCONNECTED:
-            logging.warning("[Bridge] disconnected by peer response")
-            self._emit_event(Bridge.Event.DISCONNECTED)
-            return False
-        elif res.code == bridge_pb2.Code.UNAUTHORIZED:
-            logging.warning("[Bridge] authentication failed")
-            self._emit_event(Bridge.Event.UNAUTHORIZED)
-            return False
-        elif res.code == bridge_pb2.Code.UNIDENTIFIED:
-            logging.warning("[Bridge] unidentified bridge")
-            self._emit_event(Bridge.Event.UNIDENTIFIED)
-            return False
-        else:
-            logging.error("[Bridge] call heartbeat got unexcepted code: %s",
-                bridge_pb2.Code.Name(res.code))
-            return False
-        return True
-
-    def _call_close_locked(self):
-        res = self._call_locked(bridge_pb2.CallRequest(
-            type=bridge_pb2.CallType.CLOSE,
-            token=self._token,
-            identifier=self._identifier,
-            peer_identifier=self._peer_identifier))
-        if res is None:
-            return False
-
-        if res.code == bridge_pb2.Code.OK:
-            self._emit_event(Bridge.Event.CLOSED)
-        elif res.code == bridge_pb2.Code.UNAUTHORIZED:
-            logging.warning("[Bridge] authentication failed")
-            self._emit_event(Bridge.Event.UNAUTHORIZED)
-            return False
-        elif res.code == bridge_pb2.Code.UNIDENTIFIED:
-            logging.warning("[Bridge] unidentified bridge")
-            self._emit_event(Bridge.Event.UNIDENTIFIED)
+            if not self._peer_identifier:
+                logging.warning("[Bridge] unidentified by peer,"
+                    " but bridge is clean. wait next retry")
+            else:
+                logging.warning("[Bridge] unidentified by peer")
+                self._emit_event(Bridge.Event.UNIDENTIFIED)
             return False
         elif res.code == bridge_pb2.Code.CLOSED:
-            self._emit_event(Bridge.Event.CLOSED)
+            if call_type == bridge_pb2.CallType.CLOSE:
+                self._emit_event(Bridge.Event.CLOSED)
+            else:
+                return logging_error_and_return()
         else:
-            logging.error("[Bridge] call close got unexcepted code: %s",
-                bridge_pb2.Code.Name(res.code))
-            return False
+            return logging_error_and_return()
+
         return True
 
     def _state_fn(self):
@@ -482,14 +448,13 @@ class Bridge():
 
             if self._state in Bridge._READY_STATUS:
                 if not self._ready_event.is_set():
-                    logging.info("[Bridge] bridge is ready")
                     self._ready_event.set()
             else:
                 self._ready_event.clear()
 
             if self._state in Bridge._PEER_CONNECTED_STATES:
                 if now >= self._peer_heartbeat_timeout_at:
-                    logging.debug("[Bridge] peer disconnect"
+                    logging.warning("[Bridge] peer disconnect"
                         " by heartbeat timeout")
                     self._emit_event(Bridge.Event.PEER_DISCONNECTED)
                     continue
@@ -497,23 +462,30 @@ class Bridge():
             if now >= self._next_retry_at:
                 self._next_retry_at = 0
                 if self._state in Bridge._UNCONNECTED_STATES:
-                    if not self._call_connect_locked():
+                    if not self._call_locked(bridge_pb2.CallType.CONNECT):
                         self._next_retry_at = \
                             time.time() + self._retry_interval
                         wait_timeout = min(wait_timeout,
                             self._retry_interval)
                 elif self._state in Bridge._CONNECTED_STATES:
                     if now >= self._heartbeat_timeout_at:
-                        self._call_heartbeat_locked()
-                        self._heartbeat_timeout_at = \
-                            time.time() + self._heartbeat_interval
-                        wait_timeout = min(wait_timeout,
-                            self._heartbeat_interval)
+                        if not self._call_locked(bridge_pb2.CallType.HEARTBEAT):
+                            logging.warning("[Bridge] call heartbeat failed")
+                            interval = min(self._retry_interval,
+                                           self._heartbeat_interval)
+                            self._next_retry_at = time.time() + interval
+                            wait_timeout = min(wait_timeout, interval)
+                        else:
+                            logging.debug("[Bridge] call heartbeat success")
+                            self._heartbeat_timeout_at = \
+                                time.time() + self._heartbeat_interval
+                            wait_timeout = min(wait_timeout,
+                                self._heartbeat_interval)
                     else:
                         wait_timeout = min(wait_timeout,
                             self._heartbeat_timeout_at - now)
                 elif self._state in Bridge._CLOSING_STATES:
-                    if not self._call_close_locked():
+                    if not self._call_locked(bridge_pb2.CallType.CLOSE):
                         self._next_retry_at = \
                             time.time() + self._retry_interval
                         wait_timeout = min(wait_timeout,
