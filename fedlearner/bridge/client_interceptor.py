@@ -103,91 +103,160 @@ class RetryInterceptor(grpc.UnaryUnaryClientInterceptor,
         if not method_details:
             return continuation(client_call_details, request_iterator)
 
-        srq = _SendRequestQueue(
-            method_details.request_serializer, request_iterator)
+        srq = _SingleConsumerSendRequestQueue(
+            request_iterator, method_details.request_serializer)
+        acker = _AckHelper()
 
-        def debug_fn():
-            logging.warning("[Bridge] intercept_stream_stream will call"
-                "continuation(client_call_details, iter(srq))")
-            res = continuation(client_call_details, iter(srq))
-            logging.warning("[Bridge] intercept_stream_stream call"
-                "continuation(client_call_details, iter(srq)) return")
+        def call_fn():
+            consumer = srq.consumer()
+            acker.set_consumer(consumer)
+            res = continuation(client_call_details, iter(consumer))
             return res
 
-        bridge_response_iterator = _grpc_stream_with_retry(
-            #lambda: continuation(client_call_details, iter(srq)),
-            debug_fn,
-            self._retry_interval)
+        def response_iterator(init_stream_response):
+            stream_response = init_stream_response
+            while True:
+                try:
+                    for res in stream_response:
+                        acker.ack(res.ack)
+                        yield method_details.response_deserializer(res.payload)
+                    return
+                except grpc.RpcError as e:
+                    if _grpc_error_need_recover(e):
+                        logging.warning("[Bridge] grpc stream error, status: %s"
+                            ", details: %s, wait %ds for retry",
+                            e.code(), e.details(), self._retry_interval)
+                        time.sleep(self._retry_interval)
+                        stream_response = _grpc_with_retry(
+                            call_fn, self._retry_interval)
+                        continue
+                    raise e
 
-        def response_iterator():
-            for res in bridge_response_iterator:
-                srq.ack(res.ack)
-                yield method_details.response_deserializer(res.payload)
+        init_stream_response = _grpc_with_retry(call_fn, self._retry_interval)
 
-        return response_iterator()
+        return response_iterator(init_stream_response)
 
-class _SendRequestQueue():
-    def __init__(self, request_serializer, request_iterator):
-        self._seq = 0
-        self._next = 0
-        self._lock = threading.Lock()
-        self._deque = collections.deque()
-        self._request_serializer = request_serializer
-        self._request_iterator = request_iterator
+class _AckHelper():
+    def __init__(self):
+        self._consumer = None
+
+    def set_consumer(self, consumer):
+        self._consumer = consumer
 
     def ack(self, ack):
+        self._consumer.ack(ack)
+
+class _SingleConsumerSendRequestQueue():
+    class Consumer():
+        def __init__(self, queue):
+            self._queue = queue
+
+        def ack(self, ack):
+            self._queue.ack(self, ack)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return self._queue.next(self)
+
+    def __init__(self, request_iterator, request_serializer):
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._offset = 0
+        self._deque = collections.deque()
+        self._consumer = None
+
+        self._request_lock = threading.Lock()
+        self._request_iterator = request_iterator
+        self._request_serializer = request_serializer
+
+
+    def _reset(self):
+        #logging.debug("[Bridge] _SingleConsumerSendRequestQueue reset"
+        #    ",self._offset: %d, self._seq: %d, len(self._deque): %d",
+        #    self._offset, self._seq, len(self._deque))
+        self._offset = 0
+
+    def _empty(self):
+        return self._offset == len(self._deque)
+
+    def _get(self):
+        assert not self._empty()
+        req = self._deque[self._offset]
+        self._offset += 1
+        #logging.debug("[Bridge] _SingleConsumerSendRequestQueue get: %d"
+        #    ", self._offset: %d, len(self._deque): %d, self._seq: %d",
+        #    req.seq, self._offset, len(self._deque), self._seq)
+        return req
+
+    def _add(self, raw_req):
+        req = bridge_pb2.SendRequest(
+            seq=self._seq,
+            payload=self._request_serializer(raw_req))
+        self._seq += 1
+        self._deque.append(req)
+
+    def _consumer_check(self, consumer):
+        return self._consumer == consumer
+
+    def _consumer_check_or_call(self, consumer, call):
+        if not self._consumer_check(consumer):
+            call()
+
+    def ack(self, consumer, ack):
         with self._lock:
-            logging.debug("[Bridge] stream receive ack: %d, self._seq: %d",
-                ack, self._seq)
+            if not self._consumer_check(consumer):
+                return
             if ack >= self._seq:
                 return
             n = self._seq - ack
             while len(self._deque) >= n:
                 self._deque.popleft()
-                self._next -= 1
+                self._offset -= 1
 
-    def reset(self):
-        with self._lock:
-            logging.debug("[Bridge] stream reset, self._next: %d"
-                ", self._seq: %d, len(self._deque): %d",
-                self._next, self._seq, len(self._deque))
-            self._next = 0
-
-    def __iter__(self):
-        self.reset()
-        return self
-
-    def __next__(self):
-        try:
+    def next(self, consumer):
+        def stop_iteration_fn():
+            raise StopIteration()
+        while True:
             with self._lock:
-                if self._next == len(self._deque):
-                    req = bridge_pb2.SendRequest(
-                        seq=self._seq,
-                        payload=self._request_serializer(
-                            next(self._request_iterator))
-                    )
-                    self._seq += 1
-                    self._deque.append(req)
-                req = self._deque[self._next]
-                self._next += 1
-                logging.debug("[Bridge] stream send seq: %d"
-                    ", self._next: %d, self._seq: %d",
-                    req.seq, self._next, self._seq)
+                self._consumer_check_or_call(consumer, stop_iteration_fn)
+                if not self._empty():
+                    return self._get()
 
-                return req
-        except Exception as e:
-            raise e
+            # get from request_iterator
+            with self._request_lock:
+                with self._lock:
+                    # check again
+                    self._consumer_check_or_call(consumer, stop_iteration_fn)
+                    if not self._empty():
+                        return self._get()
+                # call next maybe block by user code
+                # then return data or raise StopIteration()
+                # so use self._request_lock instead of self._lock
+                raw_req = next(self._request_iterator)
+                with self._lock:
+                    self._add(raw_req)
+                    self._consumer_check_or_call(consumer, stop_iteration_fn)
+                    return self._get()
 
-def _grpc_with_retry(handle, interval=1):
+    def consumer(self):
+        with self._lock:
+            self._reset()
+            self._consumer = _SingleConsumerSendRequestQueue.Consumer(self)
+            return self._consumer
+
+
+def _grpc_with_retry(fn, interval=1):
     while True:
         try:
-            res = handle()
-            if type(res) == grpc.RpcError: #pylint: disable=unidiomatic-typecheck
+            res = fn()
+            #pylint: disable=unidiomatic-typecheck
+            if type(res) == grpc.RpcError:
                 raise res
             return res
         except grpc.RpcError as e:
-            if e.code() in (grpc.StatusCode.UNAVAILABLE,
-                            grpc.StatusCode.INTERNAL):
+            if _grpc_error_need_recover(e):
                 logging.warning("[Bridge] grpc error, status: %s"
                     ", details: %s, wait %ds for retry",
                     e.code(), e.details(), interval)
@@ -195,24 +264,27 @@ def _grpc_with_retry(handle, interval=1):
                 continue
             raise e
 
-def _grpc_stream_with_retry(handle, interval=1):
+def _grpc_error_need_recover(e):
+    if not isinstance(e, grpc.RpcError):
+        return False
+    if e.code() in (grpc.StatusCode.UNAVAILABLE,
+                    grpc.StatusCode.INTERNAL):
+        return True
+    if e.code() == grpc.StatusCode.UNKNOWN:
+        httpstatus = _grpc_error_get_http_status(e)
+        if httpstatus:
+            if 400 <= httpstatus < 500:
+                return True
+    return False
 
-    def response_iterator(init_stream_response):
-        stream_response = init_stream_response
-        while True:
-            try:
-                yield next(stream_response)
-            except grpc.RpcError as e:
-                if e.code() in (grpc.StatusCode.UNAVAILABLE,
-                                grpc.StatusCode.INTERNAL):
-                    logging.warning("[Bridge] grpc stream error, status: %s"
-                        ", details: %s, wait %ds for retry",
-                        e.code(), e.details(), interval)
-                    time.sleep(interval)
-                    logging.warning("[Bridge] will retry grpc stream")
-                    stream_response = _grpc_with_retry(handle, interval)
-                    logging.warning("[Bridge] _grpc_with_retry return")
-                    continue
-                raise e
+def _grpc_error_get_http_status(e):
+    try:
+        details = e.details()
+        if details.count("http2 header with status") > 0:
+            fields = details.split(":")
+            if len(fields) == 2:
+                return int(details.split(":")[1])
+    except Exception: #pylint: disable=broad-except
+        pass
 
-    return response_iterator(_grpc_with_retry(handle, interval))
+    return None

@@ -49,7 +49,8 @@ class Bridge(object):
                  listen_port,
                  remote_address,
                  app_id=None,
-                 rank=0):
+                 rank=0,
+                 stream_queue_size=1024):
         self._role = role
         self._listen_address = "[::]:{}".format(listen_port)
         self._remote_address = remote_address
@@ -68,6 +69,8 @@ class Bridge(object):
         self._next_iter_id = 0
         self._received_data = collections.defaultdict(dict)
         self._stream_queue = collections.deque()
+        self._stream_queue_size = stream_queue_size
+        assert self._stream_queue_size > 0
 
         # bridge
         self._bridge = bridge_core.Bridge(
@@ -137,8 +140,11 @@ class Bridge(object):
         with self._condition:
             if self._terminated:
                 raise RuntimeError("Bridge was terminated")
-
-            logging.debug("transmit send: iter_id: %d, name: %s",
+            while len(self._stream_queue) == self._stream_queue_size:
+                logging.warning("Transmit stream queue is full"
+                                ", size: %d", len(self._stream_queue))
+                self._condition.wait()
+            logging.debug("Transmit send, iter_id: %d, name: %s",
                 msg.iter_id, msg.name)
             self._stream_queue.append(msg)
             self._condition.notifyAll()
@@ -146,10 +152,17 @@ class Bridge(object):
     def _transmit_handler(self, request):
         metrics.emit_counter('receive_counter', 1)
         with self._condition:
-            logging.debug("transmit receive, iter_id: %d, name: %s",
-                request.iter_id, request.name)
-            self._received_data[request.iter_id][request.name] = request
-            self._condition.notifyAll()
+            iter_id = self._current_iter_id \
+                if self._current_iter_id is not None else self._next_iter_id
+            if request.iter_id < iter_id:
+                logging.warning("Transmit receive expired iter_id: %d, name: %s"
+                    ". maybe cause by resend, current_iter_id: %d",
+                    request.iter_id, request.name, iter_id)
+            else:
+                logging.debug("Transmit receive, iter_id: %d, name: %s",
+                    request.iter_id, request.name)
+                self._received_data[request.iter_id][request.name] = request
+                self._condition.notifyAll()
         return tws2_pb.TransmitResponse(
             status=common_pb.Status(code=common_pb.STATUS_SUCCESS))
 
@@ -173,15 +186,21 @@ class Bridge(object):
     def current_iter_id(self):
         return self._current_iter_id
 
+    @property
+    def next_iter_id(self):
+        return self._next_iter_id
+
     def new_iter_id(self):
-        iter_id = self._next_iter_id
-        self._next_iter_id += 1
+        with self._condition:
+            iter_id = self._next_iter_id
+            self._next_iter_id += 1
         return iter_id
 
     def start(self, iter_id):
-        assert self._current_iter_id is None, "Last iter not finished"
-        self._current_iter_id = iter_id
-        logging.debug("Starting iter %d", iter_id)
+        with self._condition:
+            assert self._current_iter_id is None, "Last iter not finished"
+            self._current_iter_id = iter_id
+            logging.debug("Start iter %d", iter_id)
 
     def commit(self):
         assert self._current_iter_id is not None, "Not started yet"
@@ -190,7 +209,7 @@ class Bridge(object):
             self._current_iter_id = None
             if last_iter_id in self._received_data:
                 del self._received_data[last_iter_id]
-        logging.debug("Iter %d committed", last_iter_id)
+        logging.debug("Commit iter %d", last_iter_id)
 
     def register_data_block_handler(self, func):
         assert self._data_block_handler_fn is None, \
@@ -213,7 +232,6 @@ class Bridge(object):
             iter_id=iter_id, name=name, tensor=tf.make_tensor_proto(x)
         )
         self._transmit(msg)
-        logging.debug('Data: send %s for iter %d', name, iter_id)
 
     def send_proto(self, iter_id, name, proto):
         any_proto = any_pb.Any()
@@ -222,7 +240,6 @@ class Bridge(object):
             iter_id=iter_id, name=name, any_data=any_proto
         )
         self._transmit(msg)
-        logging.debug('Data: send protobuf %s for iter %d', name, iter_id)
 
     def send_op(self, name, x):
         def func(x):
@@ -233,8 +250,8 @@ class Bridge(object):
         return out
 
     def receive(self, iter_id, name):
-        logging.debug('Data: Waiting to receive %s for iter %d.', name,
-                      iter_id)
+        logging.debug('Data: Waiting to receive %s for iter %d.',
+            name, iter_id)
         start_time = time.time()
         with self._condition:
             while (iter_id not in self._received_data
@@ -246,20 +263,23 @@ class Bridge(object):
             data = self._received_data[iter_id][name]
         duration = time.time() - start_time
         metrics.emit_timer('receive_timer', duration)
-        logging.debug(
-            'Data: received %s for iter %d after %f sec.',
+        logging.debug('Data: received %s for iter %d after %f sec.',
             name, iter_id, duration)
         return tf.make_ndarray(data.tensor)
 
     def receive_proto(self, iter_id, name):
         logging.debug('Data: Waiting to receive proto %s for iter %d.',
                       name, iter_id)
+        start_time = time.time()
         with self._condition:
             while (iter_id not in self._received_data
                    or name not in self._received_data[iter_id]):
                 self._condition.wait()
             data = self._received_data[iter_id][name]
-        logging.debug('Data: received %s for iter %d.', name, iter_id)
+        duration = time.time() - start_time
+        metrics.emit_timer('receive_timer', duration)
+        logging.debug('Data: received %s for iter %d after %f sec.',
+            name, iter_id, duration)
         return data.any_data
 
     def receive_op(self, name, dtype):

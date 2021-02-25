@@ -428,8 +428,6 @@ class Bridge():
     def _state_fn(self):
         logging.debug("[Bridge] thread _state_fn start")
 
-        logging.info("[Bridge] remote_address: %s, listen_address: %s",
-            self._remote_address, self._listen_address)
         self._server.start()
         self._channel.subscribe(self._channel_callback)
         event_thread = threading.Thread(
