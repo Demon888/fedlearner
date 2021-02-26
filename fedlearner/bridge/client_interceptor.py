@@ -14,9 +14,9 @@ class _MethodDetail(
     pass
 
 class WaitInterceptor(grpc.UnaryUnaryClientInterceptor,
-                       grpc.UnaryStreamClientInterceptor,
-                       grpc.StreamUnaryClientInterceptor,
-                       grpc.StreamStreamClientInterceptor):
+                      grpc.UnaryStreamClientInterceptor,
+                      grpc.StreamUnaryClientInterceptor,
+                      grpc.StreamStreamClientInterceptor):
     def __init__(self, wait):
         self._methods = set()
         self._wait = wait
@@ -69,33 +69,34 @@ class RetryInterceptor(grpc.UnaryUnaryClientInterceptor,
     def intercept_unary_unary(self, continuation, client_call_details,
                               request):
         method_details = self._method_details.get(client_call_details.method)
-        if method_details:
-            return _grpc_with_retry(
-                lambda: continuation(client_call_details, request),
-                self._retry_interval)
+        if not method_details:
+            return continuation(client_call_details, request)
 
-        return continuation(client_call_details, request)
+        return _grpc_with_retry(
+            lambda: continuation(client_call_details, request),
+            self._retry_interval)
 
 
     def intercept_unary_stream(self, continuation, client_call_details,
                                request):
         method_details = self._method_details.get(client_call_details.method)
-        if method_details:
-            return _grpc_with_retry(
-                lambda: continuation(client_call_details, request),
-                self._retry_interval)
+        if not method_details:
+            return continuation(client_call_details, request)
 
-        return continuation(client_call_details, request)
+        return _grpc_with_retry(
+            lambda: continuation(client_call_details, request),
+            self._retry_interval)
 
     def intercept_stream_unary(self, continuation, client_call_details,
                                request_iterator):
         method_details = self._method_details.get(client_call_details.method)
-        if method_details:
-            return _grpc_with_retry(
-                lambda: continuation(client_call_details, request_iterator),
-                self._retry_interval)
+        if not method_details:
+            return continuation(client_call_details, request_iterator)
 
-        return continuation(client_call_details, request_iterator)
+        return _grpc_with_retry(
+            lambda: continuation(client_call_details, request_iterator),
+            self._retry_interval)
+
 
     def intercept_stream_stream(self, continuation, client_call_details,
                                 request_iterator):
@@ -107,11 +108,10 @@ class RetryInterceptor(grpc.UnaryUnaryClientInterceptor,
             request_iterator, method_details.request_serializer)
         acker = _AckHelper()
 
-        def call_fn():
+        def call():
             consumer = srq.consumer()
             acker.set_consumer(consumer)
-            res = continuation(client_call_details, iter(consumer))
-            return res
+            return continuation(client_call_details, iter(consumer))
 
         def response_iterator(init_stream_response):
             stream_response = init_stream_response
@@ -128,11 +128,11 @@ class RetryInterceptor(grpc.UnaryUnaryClientInterceptor,
                             e.code(), e.details(), self._retry_interval)
                         time.sleep(self._retry_interval)
                         stream_response = _grpc_with_retry(
-                            call_fn, self._retry_interval)
+                            call, self._retry_interval)
                         continue
                     raise e
 
-        init_stream_response = _grpc_with_retry(call_fn, self._retry_interval)
+        init_stream_response = _grpc_with_retry(call, self._retry_interval)
 
         return response_iterator(init_stream_response)
 
@@ -246,15 +246,13 @@ class _SingleConsumerSendRequestQueue():
             self._consumer = _SingleConsumerSendRequestQueue.Consumer(self)
             return self._consumer
 
-
-def _grpc_with_retry(fn, interval=1):
+def _grpc_with_retry(call, interval=1):
     while True:
         try:
-            res = fn()
-            #pylint: disable=unidiomatic-typecheck
-            if type(res) == grpc.RpcError:
-                raise res
-            return res
+            result = call()
+            if not result.running() and result.exception() is not None:
+                raise result.exception()
+            return result
         except grpc.RpcError as e:
             if _grpc_error_need_recover(e):
                 logging.warning("[Bridge] grpc error, status: %s"
@@ -265,15 +263,11 @@ def _grpc_with_retry(fn, interval=1):
             raise e
 
 def _grpc_error_need_recover(e):
-    logging.debug("[Bridge] grpc_error_need_recover, code: %s, details: %s",
-        e.code(), e.details())
     if e.code() in (grpc.StatusCode.UNAVAILABLE,
                     grpc.StatusCode.INTERNAL):
         return True
     if e.code() == grpc.StatusCode.UNKNOWN:
         httpstatus = _grpc_error_get_http_status(e.details())
-        logging.debug("[Bridge] _grpc_error_get_http_status: %s",
-            httpstatus)
         # catch all header with non-200 OK
         if httpstatus:
             #if 400 <= httpstatus < 500:
