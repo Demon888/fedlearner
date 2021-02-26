@@ -265,26 +265,30 @@ def _grpc_with_retry(fn, interval=1):
             raise e
 
 def _grpc_error_need_recover(e):
-    if not isinstance(e, grpc.RpcError):
-        return False
+    logging.debug("[Bridge] grpc_error_need_recover, code: %s, details: %s",
+        e.code(), e.details())
     if e.code() in (grpc.StatusCode.UNAVAILABLE,
                     grpc.StatusCode.INTERNAL):
         return True
     if e.code() == grpc.StatusCode.UNKNOWN:
-        httpstatus = _grpc_error_get_http_status(e)
+        httpstatus = _grpc_error_get_http_status(e.details())
+        logging.debug("[Bridge] _grpc_error_get_http_status: %s",
+            httpstatus)
+        # catch all header with non-200 OK
         if httpstatus:
-            if 400 <= httpstatus < 500:
-                return True
+            #if 400 <= httpstatus < 500:
+            #    return True
+            return True
     return False
 
-def _grpc_error_get_http_status(e):
+def _grpc_error_get_http_status(details):
     try:
-        details = e.details()
         if details.count("http2 header with status") > 0:
             fields = details.split(":")
             if len(fields) == 2:
                 return int(details.split(":")[1])
-    except Exception: #pylint: disable=broad-except
-        pass
-
+    except Exception as e: #pylint: disable=broad-except
+        logging.warning(
+            "[Bridge] grpc_error_get_http_status except: %s, details: %s",
+            repr(e), details)
     return None

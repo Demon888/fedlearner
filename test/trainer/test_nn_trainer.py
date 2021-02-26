@@ -429,7 +429,8 @@ class TestNNTraining(unittest.TestCase):
                     app_id=self.app_id,
                     data_path=os.path.join(output_path, "data/leader"),
                     ckpt_path=ckpt_path,
-                    export_path=exp_path)
+                    export_path=exp_path,
+                    epoch_num=1)
         ftm = Process(name="RunLeaderTW", target=run_lm, args=(args, ),
                 kwargs={'env' : child_env}, daemon=True)
         ftm.start()
@@ -442,7 +443,8 @@ class TestNNTraining(unittest.TestCase):
                     app_id=self.app_id,
                     data_path=os.path.join(output_path, "data/follower"),
                     ckpt_path=ckpt_path,
-                    export_path=exp_path)
+                    export_path=exp_path,
+                    epoch_num=1)
         ftm = Process(name="RunFollowerTW", target=run_fm, args=(args, ),
                 kwargs={'env' : child_env}, daemon=True)
         ftm.start()
